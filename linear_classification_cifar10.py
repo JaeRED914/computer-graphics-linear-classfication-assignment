@@ -26,6 +26,12 @@ CLASS_NAMES = [
 ]
 
 
+def ensure_matplotlib_cache_dir() -> None:
+    cache_dir = Path(__file__).resolve().parent / ".matplotlib-cache"
+    cache_dir.mkdir(exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
+
+
 def unpickle_batch(path: Path) -> dict:
     with path.open("rb") as handle:
         with warnings.catch_warnings():
@@ -92,6 +98,11 @@ def train_linear_model(x_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:
         return np.linalg.solve(xtx, xty)
     except np.linalg.LinAlgError:
         return np.linalg.pinv(xtx) @ xty
+
+
+def mean_squared_loss(x: np.ndarray, y_true: np.ndarray, weights: np.ndarray) -> float:
+    residual = (x @ weights) - y_true
+    return float(np.mean(residual**2))
 
 
 def predict_classes(x: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -176,6 +187,8 @@ def cross_validate_classifier(
 ) -> dict:
     folds = make_folds(x_train.shape[0], num_folds)
     fold_accuracies = []
+    fold_train_losses = []
+    fold_val_losses = []
 
     for fold_idx in range(num_folds):
         val_indices = folds[fold_idx]
@@ -193,14 +206,21 @@ def cross_validate_classifier(
         fold_y_train = y_train[train_indices]
         fold_y_val = y_train[val_indices]
         encoded_fold_y_train = one_hot(fold_y_train, num_classes=len(CLASS_NAMES))
+        encoded_fold_y_val = one_hot(fold_y_val, num_classes=len(CLASS_NAMES))
 
         weights = train_linear_model(fold_train, encoded_fold_y_train)
+        fold_train_losses.append(mean_squared_loss(fold_train, encoded_fold_y_train, weights))
+        fold_val_losses.append(mean_squared_loss(fold_val, encoded_fold_y_val, weights))
         preds = predict_classes(fold_val, weights)
         fold_accuracies.append(accuracy(fold_y_val, preds))
 
     return {
         "fold_accuracies": fold_accuracies,
+        "fold_train_losses": fold_train_losses,
+        "fold_val_losses": fold_val_losses,
         "mean_accuracy": float(np.mean(fold_accuracies)),
+        "mean_train_loss": float(np.mean(fold_train_losses)),
+        "mean_val_loss": float(np.mean(fold_val_losses)),
     }
 
 
@@ -224,7 +244,7 @@ def evaluate_on_test(
 
 
 def save_cv_plot(cv_result: dict, output_path: Path) -> None:
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    ensure_matplotlib_cache_dir()
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -248,8 +268,37 @@ def save_cv_plot(cv_result: dict, output_path: Path) -> None:
     plt.close()
 
 
+def save_loss_curve_plot(cv_result: dict, output_path: Path) -> None:
+    ensure_matplotlib_cache_dir()
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to save the loss curve plot.") from exc
+
+    fold_indices = np.arange(1, len(cv_result["fold_train_losses"]) + 1)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(fold_indices, cv_result["fold_train_losses"], marker="o", linewidth=2, label="Train MSE")
+    plt.plot(fold_indices, cv_result["fold_val_losses"], marker="s", linewidth=2, label="Validation MSE")
+    plt.axhline(
+        cv_result["mean_val_loss"],
+        color="red",
+        linestyle="--",
+        label=f"Mean val MSE = {cv_result['mean_val_loss']:.4f}",
+    )
+    plt.xticks(fold_indices)
+    plt.xlabel("Fold")
+    plt.ylabel("Mean squared loss")
+    plt.title("5-Fold Train/Validation Loss for Pure Linear Classification")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
 def save_confusion_matrix_plot(matrix: np.ndarray, output_path: Path) -> None:
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    ensure_matplotlib_cache_dir()
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -269,7 +318,7 @@ def save_confusion_matrix_plot(matrix: np.ndarray, output_path: Path) -> None:
 
 
 def save_class_metrics_plot(metrics: dict, output_path: Path) -> None:
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+    ensure_matplotlib_cache_dir()
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:
@@ -308,6 +357,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("linear_classification_5fold_cv.png"),
         help="Path to save the cross-validation plot.",
+    )
+    parser.add_argument(
+        "--loss-plot-path",
+        type=Path,
+        default=Path("linear_classification_loss_curve.png"),
+        help="Path to save the train/validation loss curve.",
     )
     parser.add_argument(
         "--confusion-plot-path",
@@ -353,6 +408,7 @@ def main() -> None:
     )
 
     save_cv_plot(cv_result, args.plot_path)
+    save_loss_curve_plot(cv_result, args.loss_plot_path)
     save_confusion_matrix_plot(test_result["confusion_matrix"], args.confusion_plot_path)
     save_class_metrics_plot(test_result["metrics"], args.metrics_plot_path)
 
@@ -368,11 +424,14 @@ def main() -> None:
 
     print()
     print(f"Mean 5-fold validation accuracy: {cv_result['mean_accuracy'] * 100:.2f}%")
+    print(f"Mean 5-fold train MSE:          {cv_result['mean_train_loss']:.6f}")
+    print(f"Mean 5-fold validation MSE:     {cv_result['mean_val_loss']:.6f}")
     print(f"Test-set accuracy: {test_result['accuracy'] * 100:.2f}%")
     print(f"Macro precision: {test_result['metrics']['macro_precision'] * 100:.2f}%")
     print(f"Macro recall:    {test_result['metrics']['macro_recall'] * 100:.2f}%")
     print(f"Macro F1-score:  {test_result['metrics']['macro_f1'] * 100:.2f}%")
     print(f"Cross-validation plot saved to: {args.plot_path}")
+    print(f"Loss curve plot saved to:       {args.loss_plot_path}")
     print(f"Confusion matrix plot saved to: {args.confusion_plot_path}")
     print(f"Class metrics plot saved to:    {args.metrics_plot_path}")
     print()
